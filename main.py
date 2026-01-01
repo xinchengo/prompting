@@ -17,6 +17,7 @@ import logging
 # LangChain
 from langchain.chat_models import init_chat_model
 from langgraph.func import entrypoint, task
+from langgraph.types import RetryPolicy
 
 # OpenRouter image generation
 from openrouter_image_generator import OpenRouterImageGenerator
@@ -25,10 +26,7 @@ load_dotenv()  # Load environment variables from .env file
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-
-# Global handles (initialized in main)
 # For structured output
-
 class RenderSettings(BaseModel):
     initial_position: Dict[str, float] = Field(..., description="Initial position of the object")
     initial_velocity: Dict[str, float] = Field(..., description="Initial velocity of the object")
@@ -40,6 +38,7 @@ class DescriberOutput(BaseModel):
     foreground_prompt: str = Field(..., description="Prompt for foreground object with green background")
     render_settings: RenderSettings = Field(..., description="Render settings for the object")
     
+# Global handles (initialized in main)
 describer_model = None
 reviewer_model = None
 image_generator_model = None
@@ -48,24 +47,6 @@ image_generator_client: Optional[OpenRouterImageGenerator] = None
 
 def _sanitize(text: str) -> str:
     return text.lower().replace(" ", "-")
-
-
-def _ensure_dir(path: str) -> str:
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _decode_json_response(raw_text: str) -> Dict:
-    """Best-effort JSON parsing from model output."""
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
-        if start != -1 and end != -1 and start < end:
-            return json.loads(raw_text[start : end + 1])
-        raise
-
 
 @task
 def remove_background(image_bytes: bytes) -> bytes:
@@ -83,9 +64,19 @@ def remove_background(image_bytes: bytes) -> bytes:
     return output.getvalue()
 
 
-@task
-def generate_image(prompt: str, size: str = "512x512") -> bytes:
+@task(retry_policy=RetryPolicy(max_attempts=3))
+def generate_image(prompt: str, size: str = "512x512", dry_run: bool = False) -> bytes:
     """Generate an image using OpenRouter API."""
+    if dry_run:
+        log.info(f"[DRY RUN] Skipping image generation for prompt: {prompt}")
+        # Return a placeholder image (solid color)
+        img = Image.new('RGB', (512, 512), color = (73, 109, 137))
+        d = ImageDraw.Draw(img)
+        d.text((10,10), "Placeholder Image", fill=(255,255,0))
+        output = io.BytesIO()
+        img.save(output, format="PNG")
+        return output.getvalue()
+    
     if image_generator_client is None:
         raise RuntimeError("Image generator client not initialized.")
     
@@ -95,36 +86,57 @@ def generate_image(prompt: str, size: str = "512x512") -> bytes:
         log.error(f"Failed to generate image: {e}")
         raise
 
-
-@task
-def review_scene(params: DictConfig, scene_plan: Dict) -> str:
-    """Use the reviewer model to validate prompts and render settings."""
+@task(retry_policy=RetryPolicy(max_attempts=3))
+def review_images(params: DictConfig, background_bytes: bytes, foreground_bytes: bytes) -> str:
+    """Use the reviewer model to validate generated images."""
     if params.options.generation.dry_run:
-        log.info("[DRY RUN] Skipping LLM call for review_scene")
-        return "[DRY RUN] Approved"
+        log.info("[DRY RUN] Skipping LLM call for review_images")
+        return "[DRY RUN] Images look good"
+    log.info("Reviewing generated images...")
     
     if reviewer_model is None:
         raise RuntimeError("Reviewer model not initialized.")
     
-    reviewer_prompt = params.prompts[1].reviewer
-    # Convert Pydantic model to dict for JSON serialization
-    scene_plan_dict = scene_plan.model_dump() if hasattr(scene_plan, 'model_dump') else scene_plan
+    # Encode images to base64
+    bg_b64 = base64.b64encode(background_bytes).decode('utf-8')
+    fg_b64 = base64.b64encode(foreground_bytes).decode('utf-8')
+    
+    reviewer_prompt = params.prompts.reviewer
+    message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": f"Scene specification: {params.scene_sp}"
+            },
+            {
+                "type": "image",
+                "base64": bg_b64,
+                "mime_type": "image/jpeg",
+            },
+            {
+                "type": "image",
+                "base64": fg_b64,
+                "mime_type": "image/jpeg",
+            }
+        ]
+    }
     review = reviewer_model.invoke(
         [
-            ("system", reviewer_prompt),
-            ("user", json.dumps(scene_plan_dict, indent=2)),
+            {"role": "system", "content": reviewer_prompt},
+            message,
         ]
     )
     review_text = review.content if hasattr(review, "content") else str(review)
     return review_text
 
 
-@task
+@task(retry_policy=RetryPolicy(max_attempts=3))
 def describe_scene(params: DictConfig) -> Dict:
     """Use the describer model to propose prompts and render settings."""
     if params.options.generation.dry_run:
         log.info("[DRY RUN] Skipping LLM call for describe_scene")
-        return {
+        return DescriberOutput.model_validate({
             "background_prompt": f"[DRY RUN] Background for {params.motion} in {params.scene_sp}",
             "foreground_prompt": f"[DRY RUN] Foreground object for {params.motion} with green background",
             "render_settings": {
@@ -133,12 +145,12 @@ def describe_scene(params: DictConfig) -> Dict:
                 "acceleration": {"ax": 0, "ay": 98},
                 "angular_velocity": 0
             }
-        }
+        })
     
     if describer_model is None:
         raise RuntimeError("Describer model not initialized.")
 
-    system_prompt = params.prompts[0].describer
+    system_prompt = params.prompts.describer
     
     request = (
         f"Motion: {params.motion}\n"
@@ -161,20 +173,30 @@ def describe_scene(params: DictConfig) -> Dict:
 def create_scene_assets(params: DictConfig):
     log.info(f"Generating for motion: {params.motion}, scene specification: {params.scene_sp}")
 
-    # Step 1: Describe the scene to get prompts and render settings
-    scene_plan = describe_scene(params).result()
+    success = False
+    attempt = 0
+    max_attempts = 3
+    
+    while not success and attempt < max_attempts:
+        log.info(f"Generation attempt {attempt + 1}...")
+        # Step 1: Describe the scene to get prompts and render settings
+        scene_plan = describe_scene(params).result()
 
-    if params.options.generation.review:
-        review_text = review_scene(params, scene_plan).result()
-        if "approved" not in review_text.lower():
-            log.warning("Reviewer flagged issues: %s", review_text)
+        background_bytes = generate_image(scene_plan.background_prompt, dry_run=params.options.generation.dry_run).result()
+        foreground_bytes = generate_image(scene_plan.foreground_prompt, dry_run=params.options.generation.dry_run).result()
+        foreground_alpha = remove_background(foreground_bytes).result()
+        
+        # Step 2: Review generated images
+        if params.options.generation.review:
+            review_text = review_images(params, background_bytes, foreground_bytes).result()
+            if "approved" not in review_text.lower():
+                log.warning("Reviewer flagged issues with images: %s", review_text)
+            else:
+                log.info("Reviewer approved generated images with: %s", review_text)
+                success = True
         else:
-            log.info("Reviewer approved prompts.")
-
-    # Step 2: Generate background and foreground images
-    background_bytes = generate_image(scene_plan.background_prompt).result()
-    foreground_bytes = generate_image(scene_plan.foreground_prompt).result()
-    foreground_alpha = remove_background(foreground_bytes).result()
+            success = True
+        attempt += 1
 
     # Step 3: Save outputs with structured filenames
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
