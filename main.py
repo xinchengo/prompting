@@ -151,6 +151,7 @@ def describe_scene(params: DictConfig) -> Dict:
 def create_scene_assets(params: DictConfig):
     log.info(f"Generating for motion: {params.motion}, scene specification: {params.scene_sp}")
 
+    # Step 1: Describe the scene to get prompts and render settings
     scene_plan = describe_scene(params).result()
 
     if params.options.generation.review:
@@ -160,10 +161,12 @@ def create_scene_assets(params: DictConfig):
         else:
             log.info("Reviewer approved prompts.")
 
+    # Step 2: Generate background and foreground images
     background_bytes = generate_image(scene_plan.get("background_prompt", "")).result()
     foreground_bytes = generate_image(scene_plan.get("foreground_prompt", "")).result()
     foreground_alpha = remove_background(foreground_bytes).result()
 
+    # Step 3: Save outputs with structured filenames
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = f"{_sanitize(params.motion)}__{_sanitize(params.scene_sp)}__{stamp}"
     # out_dir = _ensure_dir(os.path.join(os.getcwd(), "outputs"))

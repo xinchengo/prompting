@@ -6,9 +6,9 @@ options:
     duration: 5
   generation:
     policy: random
-    num_samples: 5
+    num_samples: 1
     review: true
-    dry_run: true
+    dry_run: false
     describer_model: bytedance-seed/seed-1.6-flash
     reviewer_model: bytedance-seed/seed-1.6-flash
     image_generator_model: bytedance-seed/seed-1.6-flash

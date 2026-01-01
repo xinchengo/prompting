@@ -1,5 +1,7 @@
 .env
 /outputs
+uv.lock
+.python-version
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
