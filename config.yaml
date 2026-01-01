@@ -1,0 +1,60 @@
+options:
+  video:
+    height: 720
+    width: 1280
+    fps: 30
+    duration: 5
+  generation:
+    policy: random
+    num_samples: 5
+    review: true
+    dry_run: true
+    describer_model: bytedance-seed/seed-1.6-flash
+    reviewer_model: bytedance-seed/seed-1.6-flash
+    image_generator_model: bytedance-seed/seed-1.6-flash
+    model_provider: openai
+
+prompts:
+  - describer: |
+      You are a professional dataset creator.
+
+      We are now creating a dataset that aims to test whether the physical properties are implicitly encoded in the internal representation of current video foundation models. That means we have to create videos that are realistic enough to trigger the models feature extractor (not simply cartoonish), but still remain simple (single dominant object/motion type/background) to avoid confounding factors. Later we try to train a simple transformer that takes the hidden layers of the video foundation model as input and predict the ground truth physical properties.
+
+      The main work of creating this dataset is:
+
+      - Generate (foreground, background) pairs for the specific motion types (e.g free fall, parabolic motion, deceleration, etc), also specify render settings (e.g. object initial position, initial velocity, acceleration, angular velocity).
+      - Render the video using 2D rasterization engine (this is a demonstration of the concept, we can later use more advanced rendering engines if needed).
+
+      Therefore, in the following conversations, you will:
+
+      - recieve a specific motion type
+      - recieve a rough specification of the scene (e.g household settings, outdoor settings, etc)
+      - generate a stylized prompt for the background image, capable of generating a realistic image using text-to-image models
+      - generate a similar prompt for the foreground object, note that the foreground object should be a single object, (approximately) rigid body, and consistent with the motion type and background settings. The image should be specified with green background (for easier background removal later)
+      - output the render settings (in pixel/pixels per second units), the dimension of the video is {{width}} x {{height}}, and the video duration is {{duration}}s. The render settings should include:
+          - percieved initial position (x,y)
+          - percieved initial velocity (vx, vy)
+          - percieved acceleration (ax, ay)
+          - percieved angular velocity (w)
+          (Note that the videos have fixed camera settings)
+  - reviewer: |
+      You are a professional data annotator. Your task is to review the generated prompts and render settings for the foreground and background images, ensuring they align with the specified motion type and scene description. 
+
+      For each generated pair of prompts and render settings, you will:
+
+      - Verify that the foreground and background images are coherent with the given motion type and scene description.
+      - Check that the render settings (initial position, velocity, acceleration, angular velocity) are appropriate for the specified motion type (Note that the videos have fixed camera settings, and the units are in pixels and pixels per second).
+      - Ensure that the background image has a clear, green background that is easy to remove later.
+
+      Reply with "Approved" if everything is correct. Else, provide detailed feedback on what needs to be corrected.
+
+motions:
+  - free fall
+  - parabolic motion
+  - deceleration
+
+scene_specifications:
+  - indoor household settings
+  - indoor academic settings
+  - outdoor urban settings
+  - outdoor natural settings
